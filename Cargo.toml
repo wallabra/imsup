@@ -1,0 +1,19 @@
+[package]
+name = "impsupri"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "0.3.30"
+get_if_addrs = "0.5.3"
+ipnetwork = "0.20.0"
+log = "0.4.22"
+ping-rs = "0.1.2"
+pretty_env_logger = "0.5.0"
+reqwest = "0.12.5"
+scraper = "0.19.1"
+serde = "1.0.204"
+serde_derive = "1.0.204"
+serde_json = "1.0.121"
+tokio = { version = "1.39.2", features = ["rt", "macros", "rt-multi-thread"] }
+tokio-macros = { version = "0.2.0-alpha.6" }
