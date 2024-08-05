@@ -337,9 +337,13 @@ async fn broadcast_ping_printers(tx: mpsc::Sender<String>) -> u32 {
                 });
 
             // Check for neighbouring network reachability
+            let prefix = network.prefix();
             if let V4(addr) = ifaddr {
+                if prefix < 24 {
+                    continue;
+                }
+
                 let ip = addr.ip;
-                let prefix = network.prefix();
                 // real  255 255 255 0
                 // outer 255 255 0   0
                 // rim   0   0   255 0
