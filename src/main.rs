@@ -481,6 +481,9 @@ async fn get_ips_from_file(tx: mpsc::Sender<String>) {
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();
+    eprintln!("Welcome to Printer Scanner.");
+
+    eprintln!("Finding printers...");
 
     let (tx, mut rx) = mpsc::channel(100);
 
@@ -524,6 +527,7 @@ async fn main() {
     }
 
     drop(task_tx);
+    eprintln!("Contacting printers...");
     let task_stream = stream::poll_fn(|c| task_rx.poll_recv(c));
 
     let aggregate: Vec<PrinterInfo> = task_stream
@@ -539,6 +543,7 @@ async fn main() {
         return;
     }
 
+    eprintln!("Serializing JSON and writing to file and stdout...");
     match serde_json::to_string(&aggregate) {
         Ok(value) => {
             println!("{}", value);
