@@ -1,20 +1,23 @@
+#![feature(is_none_or)]
 use std::collections::HashSet;
 use std::fs::{exists, File};
 use std::io::{BufRead, BufReader, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::join_all;
+use futures::{stream, StreamExt};
 use get_if_addrs::{
     get_if_addrs,
     IfAddr::{V4, V6},
 };
-use ipnetwork::IpNetwork;
+use ipnetwork::{IpNetwork, Ipv4Network};
 use log::{debug, error, info, warn};
+use scraper::selectable::Selectable;
 use scraper::{ElementRef, Html, Selector};
 use serde_derive::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 fn href_hp(addr: &str, path: &str) -> String {
     format!("http://{}/hp/device/{}", addr, path)
@@ -37,11 +40,27 @@ struct DeviceInfo {
     pub nick: Option<String>,
 }
 
+impl DeviceInfo {
+    pub fn all_null(&self) -> bool {
+        self.location.is_none()
+            && self.model.is_none()
+            && self.serial.is_none()
+            && self.name.is_none()
+            && self.nick.is_none()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct SuppliesCartridge {
     pub estim_pages_remaining: Option<u32>,
     pub printed: Option<u32>,
     pub ink_level: Option<u16>,
+}
+
+impl SuppliesCartridge {
+    pub fn all_null(&self) -> bool {
+        self.estim_pages_remaining.is_none() && self.printed.is_none() && self.ink_level.is_none()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +71,16 @@ struct Supplies {
     pub k: Option<SuppliesCartridge>,
 }
 
+fn null_option(cartridge: &Option<SuppliesCartridge>) -> bool {
+    cartridge.as_ref().is_none_or(|c| c.all_null())
+}
+
+impl Supplies {
+    pub fn all_null(&self) -> bool {
+        null_option(&self.c) && null_option(&self.m) && null_option(&self.y) && null_option(&self.k)
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct PrinterInfo {
     pub addr: String,
@@ -59,15 +88,28 @@ struct PrinterInfo {
     pub supplies: Supplies,
 }
 
+impl PrinterInfo {
+    pub fn all_null(&self) -> bool {
+        self.info.all_null() && self.supplies.all_null()
+    }
+}
+
 async fn get_document_at_href(client: &reqwest::Client, href: String) -> Result<Html, String> {
     let req = match client.get(href).send().await {
         Ok(text) => text,
         Err(err) => return Err(format!("{}", err)),
     };
-    match req.text().await {
+    let html = match req.text().await {
         Ok(text) => Ok(Html::parse_document(&text)),
         Err(err) => Err(format!("{}", err)),
-    }
+    };
+    html.and_then(|html| {
+        if is_login_screen(&html) {
+            Err("Hit a login screen".to_owned())
+        } else {
+            Ok(html)
+        }
+    })
 }
 
 fn get_cartridge_block<'a, 'h: 'a>(frag: &'h Html, colname: &str) -> Option<ElementRef<'a>> {
@@ -94,18 +136,21 @@ fn scrape_cartridge_color(colname: &str, document: &Html) -> Option<SuppliesCart
         }),
         printed: get_cartridge_row(&block, "PagesPrintedWithSupply").map(|s| s.parse().unwrap()),
         ink_level: (block
-            .select(&Selector::parse(".consumable-block-header .data.percentage").unwrap())
+            .select(&Selector::parse(".consumable-block-header > .data.percentage").unwrap())
             .next()
-            .map(|s| {
-                (s.text()
+            .and_then(|s| {
+                let s = s
+                    .text()
                     .collect::<String>()
                     .chars()
                     .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse::<u32>()
-                    .unwrap()
-                    * u16::MAX as u32
-                    / 100) as u16
+                    .collect::<String>();
+
+                if s.is_empty() {
+                    None
+                } else {
+                    Some((s.parse::<u32>().unwrap() * u16::MAX as u32 / 100) as u16)
+                }
             })),
     })
 }
@@ -138,6 +183,13 @@ fn scrape_device_info(document: Html) -> DeviceInfo {
     }
 }
 
+fn is_login_screen(document: &Html) -> bool {
+    document
+        .select(&Selector::parse(".loginscreen").unwrap())
+        .next()
+        .is_some()
+}
+
 async fn get_supplies_info(client: reqwest::Client, addr: String) -> Result<Supplies, String> {
     let href = href_supplies_page(&addr);
     let document = get_document_at_href(&client, href.clone()).await?;
@@ -156,7 +208,7 @@ async fn process_addr<'a>(addr: String) -> Result<PrinterInfo, String> {
     info!("Contacting printer: {}", addr);
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(3))
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap();
@@ -164,47 +216,78 @@ async fn process_addr<'a>(addr: String) -> Result<PrinterInfo, String> {
     let device_info = get_device_info(client.clone(), addr.clone());
     let supplies_info = get_supplies_info(client.clone(), addr.clone());
 
-    Ok(PrinterInfo {
-        addr,
+    let info = PrinterInfo {
+        addr: addr.clone(),
         info: device_info.await?,
         supplies: supplies_info.await?,
-    })
+    };
+
+    if info.all_null() {
+        Err(format!(
+            "Could not get any info about supposed printer at address {}",
+            addr
+        ))
+    } else {
+        Ok(info)
+    }
 }
 
-async fn prod_addr_for_printer(own_tx: mpsc::Sender<String>, target: IpAddr) {
-    tokio::spawn(async move {
-        let data = [1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 5, 4, 3, 2, 1, 0];
-        let timeout = Duration::from_secs(2);
-        //debug!("Pinging address {}..", addr);
-        if let Ok(reply) = ping_rs::send_ping_async(&target, timeout, Arc::new(&data), None).await {
-            let saddr = target.to_string();
-            let href = href_hp(&saddr, "DeviceStatus/Index");
+async fn prod_addr_for_printer(own_tx: mpsc::Sender<String>, target: IpAddr) -> bool {
+    let data = [1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 5, 4, 3, 2, 1, 0];
+    let timeout = Duration::from_secs(1);
+    //debug!("Pinging address {}..", target);
 
-            debug!(
-                "Prodding address {} (on {}) to check if is compatible printer.. ({:?})",
-                target, href, reply
-            );
+    if let Ok(_) = ping_rs::send_ping_async(&target, timeout, Arc::new(&data), None).await {
+        let saddr = target.to_string();
+        let href = href_hp(&saddr, "DeviceStatus/Index");
 
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(3))
-                .danger_accept_invalid_certs(true)
-                .build()
-                .unwrap();
+        debug!(
+            "Prodding address {} to check if is compatible printer..",
+            target
+        );
 
-            if client.get(href).send().await.is_ok() {
-                info!("Found printer: {}", target);
-                if let Err(err_addr) = own_tx.send(saddr).await {
-                    error!("Async receiver dropped before printer address could be sent from contact thread: {}", err_addr)
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+
+        let res = client.get(href).send().await;
+        if let Ok(doc) = res {
+            let text = match doc.text().await {
+                Ok(text) => text,
+                Err(_err) => {
+                    return false;
                 }
             };
-        }
-    });
+
+            let html = Html::parse_document(&text);
+
+            if html
+                .select(&Selector::parse("body#PageDeviceStatus").unwrap())
+                .next()
+                .is_some()
+            {
+                info!("Found printer: {}", target);
+                if let Err(err_addr) = own_tx.send(saddr).await {
+                    error!("Async receiver dropped before printer address could be sent from contact thread: {}", err_addr);
+                    return false;
+                }
+                return true;
+            } else {
+                debug!("Is not printer: {}", target);
+            }
+        };
+    }
+    false
 }
 
-async fn broadcast_ping_printers(tx: mpsc::Sender<String>) {
+async fn broadcast_ping_printers(tx: mpsc::Sender<String>) -> u32 {
     let mut tried: HashSet<IpAddr> = HashSet::new();
 
     let ifaces = get_if_addrs();
+    let (tc_tx, mut tc_rx) = mpsc::unbounded_channel();
+    let task_stream = stream::poll_fn(|c| tc_rx.poll_recv(c));
 
     if let Ok(ifaces) = ifaces {
         for iface in ifaces {
@@ -221,25 +304,107 @@ async fn broadcast_ping_printers(tx: mpsc::Sender<String>) {
             }
             tried.insert(ip);
 
-            let network = match ifaddr {
+            let network = match ifaddr.clone() {
                 V4(addr) => IpNetwork::with_netmask(ip, IpAddr::V4(addr.netmask)),
                 V6(addr) => IpNetwork::with_netmask(ip, IpAddr::V6(addr.netmask)),
             };
 
-            if let Ok(network) = network {
-                for target in &network {
-                    let tip = target;
-
-                    if tip == ip {
-                        continue;
-                    }
-
-                    let own_tx = tx.clone();
-                    prod_addr_for_printer(own_tx, tip).await;
+            let network = match network {
+                Ok(network) => network,
+                Err(err) => {
+                    warn!(
+                        "Could not use network info on interface {}: {:?}",
+                        iface.name, err
+                    );
+                    continue;
                 }
+            };
+
+            let own_tx = tx.clone();
+            network
+                .iter()
+                .filter_map(|target| {
+                    if target == ip {
+                        None
+                    } else {
+                        Some((target, prod_addr_for_printer(own_tx.clone(), target)))
+                    }
+                })
+                .for_each(|(target, task)| {
+                    if let Err(e) = tc_tx.clone().send(task) {
+                        error!("Error sending task to ping {}: {}", target, e);
+                    }
+                });
+
+            // Check for neighbouring network reachability
+            if let V4(addr) = ifaddr {
+                let ip = addr.ip;
+                let prefix = network.prefix();
+                // real  255 255 255 0
+                // outer 255 255 0   0
+                // rim   0   0   255 0
+                let rim_mask = Ipv4Addr::from_bits(0xFFu32 << (32 - prefix));
+                let keep_mask = !rim_mask;
+
+                join_all((0u32..=255u32).map(|num| {
+                    let tx = tx.clone();
+                    let tc_tx = tc_tx.clone();
+                    async move {
+                        let neigh_ip = Ipv4Addr::from_bits(
+                            ip.to_bits() & keep_mask.to_bits()
+                                | ((num << (32 - prefix)) & rim_mask.to_bits()),
+                        );
+                        let neighbor = Ipv4Network::new(neigh_ip, network.prefix()).unwrap();
+
+                        if IpNetwork::V4(neighbor) == network {
+                            return;
+                        }
+
+                        //debug!("Testing neighbouring subnet: {:?}", neighbor);
+
+                        let own_tx = tx.clone();
+                        let gateway = Ipv4Addr::from_bits(
+                            neighbor.ip().to_bits() & neighbor.mask().to_bits() | 1,
+                        );
+                        let data = [1, 2, 3, 4, 5, 6, 7, 8, 7, 6, 5, 4, 3, 2, 1, 0];
+                        let timeout = Duration::from_secs(1);
+
+                        if let Ok(_reply) = ping_rs::send_ping_async(
+                            &IpAddr::V4(gateway),
+                            timeout,
+                            Arc::new(&data),
+                            None,
+                        )
+                        .await
+                        {
+                            debug!("Reached network gateway of neighbor subnet: {:?}", neighbor);
+
+                            neighbor.iter().for_each(|target| {
+                                if let Err(err) = tc_tx
+                                    .send(prod_addr_for_printer(own_tx.clone(), IpAddr::V4(target)))
+                                {
+                                    error!(
+                                        "Error sending task to check neighboring target {}: {}",
+                                        target, err
+                                    );
+                                }
+                            })
+                        }
+                    }
+                }))
+                .await;
             }
         }
     }
+
+    drop(tc_tx);
+    task_stream
+        .buffer_unordered(256)
+        .collect::<Vec<_>>()
+        .await
+        .iter()
+        .map(|b| *b as u32)
+        .sum()
 }
 
 const IP_FNAME: &str = "impressoras.txt";
@@ -314,14 +479,18 @@ async fn main() {
     pretty_env_logger::init();
 
     let (tx, mut rx) = mpsc::channel(100);
-    let mut aggregate: Vec<PrinterInfo> = vec![];
-    let mut tasks: Vec<(String, JoinHandle<Result<PrinterInfo, String>>)> = vec![];
 
-    broadcast_ping_printers(tx.clone()).await;
+    let num_found = broadcast_ping_printers(tx.clone()).await;
+    info!(
+        "Automatically found {} printers to process in the network",
+        num_found
+    );
     get_ips_from_file(tx.clone()).await;
     drop(tx);
 
     let mut checked: HashSet<String> = HashSet::new();
+
+    let (task_tx, mut task_rx) = mpsc::unbounded_channel();
 
     while let Some(addr) = rx.recv().await {
         if checked.contains(&addr) {
@@ -329,29 +498,40 @@ async fn main() {
             continue;
         }
         checked.insert(addr.clone());
-        let task = tokio::spawn(process_addr(addr.to_owned()));
-        tasks.push((addr.to_owned(), task));
-    }
-
-    for (addr, result) in
-        futures::future::join_all(tasks.into_iter().map(|(addr, t)| async { (addr, t.await) }))
-            .await
-    {
-        match result {
-            Ok(r_info) => match r_info {
-                Ok(info) => aggregate.push(info),
+        let task_addr = addr.clone();
+        let task = async move {
+            match process_addr(task_addr.clone()).await {
+                Ok(info) => Some(info),
                 Err(err) => {
-                    error!("Error reading printer info from address {}: {}", addr, err)
+                    warn!(
+                        "Error reading printer info from address {}: {}",
+                        task_addr, err
+                    );
+                    None
                 }
-            },
-            Err(err) => {
-                error!("Error reading printer info from address {}: {}", addr, err)
             }
+        };
+        if let Err(err) = task_tx.send(task) {
+            error!(
+                "Error sending task to process printer at address {}: {}",
+                addr, err
+            );
         }
     }
 
+    drop(task_tx);
+    let task_stream = stream::poll_fn(|c| task_rx.poll_recv(c));
+
+    let aggregate: Vec<PrinterInfo> = task_stream
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+
     if aggregate.is_empty() {
-        warn!("No printer information obtained, aborting");
+        error!("No printer information obtained, aborting");
         return;
     }
 
