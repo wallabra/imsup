@@ -350,7 +350,7 @@ async fn broadcast_ping_printers(tx: mpsc::Sender<String>) -> u32 {
                 let rim_mask = Ipv4Addr::from_bits(0xFFu32 << (32 - prefix));
                 let keep_mask = !rim_mask;
 
-                join_all((0u32..=255u32).map(|num| {
+                join_all((0u32..=254u32).map(|num| {
                     let tx = tx.clone();
                     let tc_tx = tc_tx.clone();
                     async move {
