@@ -298,24 +298,27 @@ async fn main() {
             String::from("\"serial\",\"c\",\"m\",\"y\",\"k\"\n")
                 + &aggregate
                     .iter()
-                    .filter_map(|pi: &PrinterInfo| match &pi.info.serial {
-                        None => None,
-                        Some(serial) => Some(format!(
-                            "\"{}\",{}",
-                            serial,
-                            pi.supplies
-                                .as_vec()
-                                .iter()
-                                .map(|cart| match cart {
-                                    None => "\"\"".to_owned(),
-                                    Some(val) =>
-                                        "\"".to_owned()
-                                            + &val.printed.map_or("".to_owned(), |v| v.to_string())
-                                            + "\"",
-                                })
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        )),
+                    .filter_map(|pi: &PrinterInfo| {
+                        pi.info.serial.as_ref().map(|serial| {
+                            format!(
+                                "\"{}\",{}",
+                                serial,
+                                pi.supplies
+                                    .as_vec()
+                                    .iter()
+                                    .map(|cart| match cart {
+                                        None => "\"\"".to_owned(),
+                                        Some(val) =>
+                                            "\"".to_owned()
+                                                + &val
+                                                    .printed
+                                                    .map_or("".to_owned(), |v| v.to_string())
+                                                + "\"",
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            )
+                        })
                     })
                     .collect::<Vec<_>>()
                     .join("\n")

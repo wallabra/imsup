@@ -63,8 +63,8 @@ impl Supplies {
     }
 
     /// Returns the [SupplyCartridge]s as a Vec, in the CMYK order.
-    pub fn as_vec<'a>(&'a self) -> Vec<&'a Option<SuppliesCartridge>> {
-        return vec![&self.c, &self.m, &self.y, &self.k];
+    pub fn as_vec(&self) -> Vec<&Option<SuppliesCartridge>> {
+        vec![&self.c, &self.m, &self.y, &self.k]
     }
 }
 
