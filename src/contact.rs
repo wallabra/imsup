@@ -7,9 +7,28 @@ use scraper::{Html, Selector};
 use tokio::sync::mpsc;
 
 use crate::{
-    printerinfo::PrinterInfo,
-    scrape::{get_device_info_datum, href_hp},
+    printerinfo::{DeviceInfo, PrinterInfo, Supplies},
+    scrape::{
+        get_document_at_href, href_hp, href_hp_device_info, href_hp_supplies_page,
+        scrape_device_info, scrape_supplies_info,
+    },
 };
+
+/// Scrape the [Supplies] from a printer IP address.
+async fn get_supplies_info(client: reqwest::Client, addr: String) -> Result<Supplies, String> {
+    let href = href_hp_supplies_page(&addr);
+    let document = get_document_at_href(&client, href.clone()).await?;
+    info!("Got supplies info page for {}: {}", addr, href);
+    Ok(scrape_supplies_info(document))
+}
+
+/// Scrape the [DeviceInfo] from a printer IP address.
+async fn get_device_info(client: reqwest::Client, addr: String) -> Result<DeviceInfo, String> {
+    let href = href_hp_device_info(&addr);
+    let document = get_document_at_href(&client, href.clone()).await?;
+    info!("Got device info page for {}: {}", addr, href);
+    Ok(scrape_device_info(document))
+}
 
 /// Contact a printer via HTTP and scrapes all possible info from it if
 /// applicable.
@@ -22,8 +41,8 @@ pub async fn process_addr<'a>(addr: String) -> Result<PrinterInfo, String> {
         .build()
         .unwrap();
 
-    let device_info = get_device_info(client.clone(), &addr);
-    let supplies_info = get_supplies_info(client.clone(), &addr);
+    let device_info = get_device_info(client.clone(), addr.clone());
+    let supplies_info = get_supplies_info(client.clone(), addr.clone());
 
     let info = PrinterInfo {
         addr: addr.clone(),
@@ -49,7 +68,10 @@ pub async fn prod_addr_for_printer(tx: mpsc::Sender<String>, target: IpAddr) -> 
     let timeout = Duration::from_secs(1);
     //debug!("Pinging address {}..", target);
 
-    if let Ok(_) = ping_rs::send_ping_async(&target, timeout, Arc::new(&data), None).await {
+    if ping_rs::send_ping_async(&target, timeout, Arc::new(&data), None)
+        .await
+        .is_ok()
+    {
         let saddr = target.to_string();
         let href = href_hp(&saddr, "DeviceStatus/Index");
 

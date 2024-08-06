@@ -1,26 +1,18 @@
 use std::collections::HashSet;
 use std::fs::{exists, File};
 use std::io::{BufRead, BufReader, Write};
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::Arc;
-use std::time::Duration;
+use std::net::IpAddr;
 
 use clap::{Parser, ValueEnum};
-use futures::future::join_all;
 use futures::{stream, StreamExt};
-use get_if_addrs::{
-    get_if_addrs,
-    IfAddr::{V4, V6},
-};
-use ipnetwork::{IpNetwork, Ipv4Network};
-use log::{debug, error, info, warn};
-use scraper::selectable::Selectable;
-use scraper::{ElementRef, Html, Selector};
-use serde_derive::{Deserialize, Serialize};
+use impsupri::contact::process_addr;
+use impsupri::printerinfo::PrinterInfo;
+use impsupri::scan::broadcast_ping_printers;
+use log::{error, info, warn};
 use tokio::sync::mpsc;
 
 /// Network printer scanning mode.
-#[derive(ValueEnum)]
+#[derive(ValueEnum, PartialEq, Debug, Clone, Copy, Default)]
 enum ScanMode {
     /// Skips scanning for printers in the network.
     #[value()]
@@ -35,13 +27,8 @@ enum ScanMode {
     /// This is always skipped if the current network is bigger than a /24, for
     /// scalability and security reasons.
     #[value()]
+    #[default]
     Cluster,
-}
-
-impl Default for ScanMode {
-    fn default() -> Self {
-        return ScanMode::Cluster;
-    }
 }
 
 /// Scans for HP printers, from a list of IPs and from the network, and
@@ -51,12 +38,14 @@ impl Default for ScanMode {
 struct Args {
     /// Disables reading from an IP list file.
     #[arg(short, long)]
-    no_ip_list: bool,
+    disable_ip_list: bool,
 
     /// File from which to read a list of IPs to always contact
     ///
     /// These IPs are processed independently from the scanner's, but no same
     /// IP is contacted twice.
+    ///
+    /// Defaults to "impressoras.txt" for historical reasons.
     #[arg(short, long)]
     ip_list: Option<String>,
 
@@ -73,32 +62,48 @@ struct Args {
     no_out: bool,
 
     /// Output filename of JSON report.
+    ///
+    /// Defaults to "relatorio_impressoras.json" for historical reasons.
     #[arg(short, long)]
     out: Option<String>,
 
     /// Disable non-logger status prints.
     #[arg(short, long)]
     quiet: Option<String>,
+
+    /// Number of simultaneous concurrent printer scraper tasks to run.
+    ///
+    /// The higher, the faster the scanner printers list will be processed,
+    /// but the higher the chance of a contact failing due to overload.
+    /// The default is 4.
+    #[arg(long, short)]
+    contact_parallel: Option<usize>,
+
+    /// Number of simultaneous ping tasks to run.
+    ///
+    /// The default is 512.
+    #[arg(long, short)]
+    ping_parallel: Option<usize>,
 }
 
 async fn get_ips_from_file(fname: &str, tx: mpsc::Sender<String>) {
     match exists(fname) {
         Ok(existence) => {
             if !existence {
-                info!("Address list file {:?} not found, skipping it", IP_FNAME);
+                info!("Address list file {:?} not found, skipping it", fname);
                 return;
             }
         }
         Err(err) => {
             error!(
                 "Could not verify the existence of address list file {:?}: {}",
-                IP_FNAME, err
+                fname, err
             );
             return;
         }
     }
 
-    info!("Address list file {:?} found, processing IPs...", IP_FNAME);
+    info!("Address list file {:?} found, processing IPs...", fname);
 
     let ip_fopen = File::open(fname);
     match ip_fopen {
@@ -118,20 +123,17 @@ async fn get_ips_from_file(fname: &str, tx: mpsc::Sender<String>) {
                             continue;
                         }
                         if line.parse::<IpAddr>().is_err() {
-                            warn!("Line from address list file {:?} (line {}) could not be parsed as an IP address: {}", IP_FNAME, linenum + 1, line);
+                            warn!("Line from address list file {:?} (line {}) could not be parsed as an IP address: {}", fname, linenum + 1, line);
                             continue;
                         }
                         info!("Found listed printer address to check: {}", line);
                         if let Err(line) = tx.send(line).await {
-                            error!("Async receiver dropped before addresses from address list file {:?} could be sent: {}", IP_FNAME, line);
+                            error!("Async receiver dropped before addresses from address list file {:?} could be sent: {}", fname, line);
                             break;
                         }
                     }
                     Err(err) => {
-                        error!(
-                            "Could not read line from IP list file {:?}: {}",
-                            IP_FNAME, err
-                        );
+                        error!("Could not read line from IP list file {:?}: {}", fname, err);
                     }
                 }
             }
@@ -139,36 +141,44 @@ async fn get_ips_from_file(fname: &str, tx: mpsc::Sender<String>) {
         Err(fopen_err) => {
             error!(
                 "Couldn't open existing address list file {:?}: {}",
-                IP_FNAME, fopen_err
+                fname, fopen_err
             );
         }
     }
 }
 
-const IP_DEFAULT_NAME: &str = "impressoras.txt";
-const OUT_DEFAULT_NAME: &str = "relatorio_impressoras.json";
+const IP_DEFAULT_FNAME: &str = "impressoras.txt";
+const OUT_DEFAULT_FNAME: &str = "relatorio_impressoras.json";
 
 #[tokio::main]
 async fn main() {
+    let args = Args::parse();
+
     pretty_env_logger::init();
     eprintln!("Welcome to Printer Scanner.");
 
-    let args = Args::parse();
-
+    // Find printers to contact.
+    //
+    // Relevant addresses will be received through the
+    // [tokio::mpsc::channel] below.
     eprintln!("Finding printers...");
 
     let (tx, mut rx) = mpsc::channel(100);
 
     if args.scan_mode.unwrap_or_default() != ScanMode::None {
-        let num_found =
-            broadcast_ping_printers(tx.clone(), args.scan_mode == ScanMode::Cluster).await;
+        let num_found = broadcast_ping_printers(
+            tx.clone(),
+            args.scan_mode.unwrap_or_default() == ScanMode::Cluster,
+            args.ping_parallel.unwrap_or(512),
+        )
+        .await;
         info!(
             "Automatically found {} printers to process in the network",
             num_found
         );
     }
 
-    if !args.no_ip_list {
+    if !args.disable_ip_list {
         get_ips_from_file(
             &args.ip_list.unwrap_or(IP_DEFAULT_FNAME.to_owned()),
             tx.clone(),
@@ -177,6 +187,13 @@ async fn main() {
     }
     drop(tx);
 
+    // Contact printers.
+    //
+    // Contact tasks will be generated and sent through
+    // the [tokio::mpsc::unbounded_channel] below.
+    //
+    // This way they can be done in batches using
+    // [futures::StreamExt::buffer_unordered].
     let mut checked: HashSet<String> = HashSet::new();
 
     let (task_tx, mut task_rx) = mpsc::unbounded_channel();
@@ -209,11 +226,13 @@ async fn main() {
     }
 
     drop(task_tx);
+
+    // Execute the contact tasks.
     eprintln!("Contacting printers...");
     let task_stream = stream::poll_fn(|c| task_rx.poll_recv(c));
 
     let aggregate: Vec<PrinterInfo> = task_stream
-        .buffer_unordered(4)
+        .buffer_unordered(args.contact_parallel.unwrap_or(4))
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -225,6 +244,7 @@ async fn main() {
         return;
     }
 
+    // Produce the JSON and write it to output.
     eprintln!("Serializing JSON and writing to file and stdout...");
     match serde_json::to_string(&aggregate) {
         Ok(value) => {
@@ -232,10 +252,10 @@ async fn main() {
                 println!("{}", value);
             }
             if !args.no_out {
-                if let Ok(mut file) = File::create(args.out.unwrap_or(OUT_DEFAULT_NAME.to_owned()))
-                {
+                let out_fname = args.out.unwrap_or(OUT_DEFAULT_FNAME.to_owned());
+                if let Ok(mut file) = File::create(out_fname.clone()) {
                     if let Err(err) = file.write_all(value.as_bytes()) {
-                        error!("Error writing JSON to output file {:?}: {}", OUT_FNAME, err);
+                        error!("Error writing JSON to output file {:?}: {}", out_fname, err);
                     }
                 }
             }

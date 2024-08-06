@@ -1,3 +1,5 @@
+use serde_derive::{Deserialize, Serialize};
+
 #[derive(Serialize, Deserialize)]
 /// The information collected from the HP device information page.
 ///
@@ -30,8 +32,6 @@ impl DeviceInfo {
 pub struct SuppliesCartridge {
     pub estim_pages_remaining: Option<u32>,
     pub printed: Option<u32>,
-
-    let ip_fopen = File::open(fname);
     pub ink_level: Option<u16>,
 }
 
