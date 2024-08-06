@@ -196,6 +196,16 @@ async fn main() {
 
     let (tx, mut rx) = mpsc::channel(100);
 
+    // File list
+    if !args.disable_ip_list {
+        get_ips_from_file(
+            &args.ip_list.unwrap_or(IP_DEFAULT_FNAME.to_owned()),
+            tx.clone(),
+        )
+        .await;
+    }
+
+    // Network scan
     if args.scan_mode.unwrap_or_default() != ScanMode::None {
         let num_found = broadcast_ping_printers(
             tx.clone(),
@@ -209,13 +219,6 @@ async fn main() {
         );
     }
 
-    if !args.disable_ip_list {
-        get_ips_from_file(
-            &args.ip_list.unwrap_or(IP_DEFAULT_FNAME.to_owned()),
-            tx.clone(),
-        )
-        .await;
-    }
     drop(tx);
 
     // Contact printers.
@@ -229,6 +232,7 @@ async fn main() {
 
     let (task_tx, mut task_rx) = mpsc::unbounded_channel();
 
+    // Generate contact tasks
     while let Some(addr) = rx.recv().await {
         if checked.contains(&addr) {
             info!("Skipping duplicate address: {}", addr);
@@ -258,7 +262,7 @@ async fn main() {
 
     drop(task_tx);
 
-    // Execute the contact tasks.
+    // Execute contact tasks
     eprintln!("Contacting printers...");
     let task_stream = stream::poll_fn(|c| task_rx.poll_recv(c));
 
@@ -275,7 +279,7 @@ async fn main() {
         return;
     }
 
-    // Produce the JSON and write it to output.
+    // Generate output
     let output_mode = args.output_mode.unwrap_or_default();
 
     let value = match output_mode {
