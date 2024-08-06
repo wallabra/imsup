@@ -295,35 +295,37 @@ async fn main() {
         }
         OutputMode::PrintedPages => {
             eprintln!("Return printed pages table...");
-            aggregate
-                .iter()
-                .filter_map(|pi: &PrinterInfo| match &pi.info.serial {
-                    None => None,
-                    Some(serial) => Some(format!(
-                        "\"{}\",{}",
-                        serial,
-                        pi.supplies
-                            .as_vec()
-                            .iter()
-                            .map(|cart| match cart {
-                                None => "\"\"".to_owned(),
-                                Some(val) =>
-                                    "\"".to_owned()
-                                        + &val.printed.map_or("".to_owned(), |v| v.to_string())
-                                        + "\"",
-                            })
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )),
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+            String::from("\"serial\",\"c\",\"m\",\"y\",\"k\"")
+                + &aggregate
+                    .iter()
+                    .filter_map(|pi: &PrinterInfo| match &pi.info.serial {
+                        None => None,
+                        Some(serial) => Some(format!(
+                            "\"{}\",{}",
+                            serial,
+                            pi.supplies
+                                .as_vec()
+                                .iter()
+                                .map(|cart| match cart {
+                                    None => "\"\"".to_owned(),
+                                    Some(val) =>
+                                        "\"".to_owned()
+                                            + &val.printed.map_or("".to_owned(), |v| v.to_string())
+                                            + "\"",
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
         }
         OutputMode::None => {
             return;
         }
     };
 
+    // Write output
     eprintln!("Writing to file and stdout...");
 
     if !args.writeless {
