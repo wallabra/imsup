@@ -295,7 +295,7 @@ async fn main() {
         }
         OutputMode::PrintedPages => {
             eprintln!("Return printed pages table...");
-            String::from("\"serial\",\"c\",\"m\",\"y\",\"k\"")
+            String::from("\"serial\",\"c\",\"m\",\"y\",\"k\"\n")
                 + &aggregate
                     .iter()
                     .filter_map(|pi: &PrinterInfo| match &pi.info.serial {
