@@ -31,6 +31,28 @@ enum ScanMode {
     Cluster,
 }
 
+/// Output mode.
+#[derive(ValueEnum, PartialEq, Debug, Clone, Copy, Default)]
+enum OutputMode {
+    /// No output.
+    #[value()]
+    None,
+
+    /// JSON output.
+    #[value()]
+    Json,
+
+    /// The # of pages printed per color cartridge per printer.
+    /// Produces a CSV with 5 columns:
+    ///   serial  c  m  y  k
+    ///
+    /// Mono printers will have empty columns for all colors, except key
+    /// (black).
+    #[value(name = "printed_values")]
+    #[default]
+    PrintedPages,
+}
+
 /// Scans for HP printers, from a list of IPs and from the network, and
 /// scrapes their internal webpages for information, producing a JSON report
 /// that can be written to stdout or to a file.
@@ -50,6 +72,8 @@ struct Args {
     ip_list: Option<String>,
 
     /// Sets the network scanning mode.
+    ///
+    /// Defaults to 'cluster'.
     #[arg(value_enum, short, long)]
     scan_mode: Option<ScanMode>,
 
@@ -63,7 +87,7 @@ struct Args {
 
     /// Output filename of JSON report.
     ///
-    /// Defaults to "relatorio_impressoras.json" for historical reasons.
+    /// Defaults to "relatorio_impressoras.<ext>" for historical reasons.
     #[arg(short, long)]
     out: Option<String>,
 
@@ -75,8 +99,9 @@ struct Args {
     ///
     /// The higher, the faster the scanner printers list will be processed,
     /// but the higher the chance of a contact failing due to overload.
+    ///
     /// The default is 4.
-    #[arg(long, short)]
+    #[arg(long, short = 't')]
     contact_parallel: Option<usize>,
 
     /// Number of simultaneous ping tasks to run.
@@ -84,6 +109,12 @@ struct Args {
     /// The default is 512.
     #[arg(long, short)]
     ping_parallel: Option<usize>,
+
+    /// Sets the kind of report to generate.
+    ///
+    /// Defaults to 'printed_pages' for historical reasons.
+    #[arg(value_enum, short = 'm', long)]
+    output_mode: Option<OutputMode>,
 }
 
 async fn get_ips_from_file(fname: &str, tx: mpsc::Sender<String>) {
@@ -148,7 +179,7 @@ async fn get_ips_from_file(fname: &str, tx: mpsc::Sender<String>) {
 }
 
 const IP_DEFAULT_FNAME: &str = "impressoras.txt";
-const OUT_DEFAULT_FNAME: &str = "relatorio_impressoras.json";
+const OUT_DEFAULT_FNAME: &str = "relatorio_impressoras";
 
 #[tokio::main]
 async fn main() {
@@ -245,21 +276,69 @@ async fn main() {
     }
 
     // Produce the JSON and write it to output.
-    eprintln!("Serializing JSON and writing to file and stdout...");
-    match serde_json::to_string(&aggregate) {
-        Ok(value) => {
-            if !args.writeless {
-                println!("{}", value);
-            }
-            if !args.no_out {
-                let out_fname = args.out.unwrap_or(OUT_DEFAULT_FNAME.to_owned());
-                if let Ok(mut file) = File::create(out_fname.clone()) {
-                    if let Err(err) = file.write_all(value.as_bytes()) {
-                        error!("Error writing JSON to output file {:?}: {}", out_fname, err);
-                    }
+    let output_mode = args.output_mode.unwrap_or_default();
+
+    let value = match output_mode {
+        OutputMode::Json => {
+            eprintln!("Generating output JSON...");
+            match serde_json::to_string(&aggregate) {
+                Ok(value) => value,
+                Err(err) => {
+                    error!("Error producing JSON for aggregate printer info: {}", err);
+                    return;
                 }
             }
         }
-        Err(err) => error!("Error producing JSON for aggregate printer info: {}", err),
+        OutputMode::PrintedPages => {
+            eprintln!("Return printed pages table...");
+            aggregate
+                .iter()
+                .filter_map(|pi: &PrinterInfo| match &pi.info.serial {
+                    None => None,
+                    Some(serial) => Some(format!(
+                        "\"{}\",{}",
+                        serial,
+                        pi.supplies
+                            .as_vec()
+                            .iter()
+                            .map(|cart| match cart {
+                                None => "\"\"".to_owned(),
+                                Some(val) =>
+                                    "\"".to_owned()
+                                        + &val.printed.map_or("".to_owned(), |v| v.to_string())
+                                        + "\"",
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        OutputMode::None => {
+            return;
+        }
+    };
+
+    eprintln!("Writing to file and stdout...");
+
+    if !args.writeless {
+        println!("{}", value);
+    }
+    if !args.no_out {
+        let out_fname = args.out.unwrap_or(format!(
+            "{}.{}",
+            OUT_DEFAULT_FNAME,
+            match output_mode {
+                OutputMode::None => "",
+                OutputMode::Json => "json",
+                OutputMode::PrintedPages => "csv",
+            }
+        ));
+        if let Ok(mut file) = File::create(out_fname.clone()) {
+            if let Err(err) = file.write_all(value.as_bytes()) {
+                error!("Error writing JSON to output file {:?}: {}", out_fname, err);
+            }
+        }
     }
 }

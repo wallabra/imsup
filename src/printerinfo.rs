@@ -57,8 +57,14 @@ fn null_option(cartridge: &Option<SuppliesCartridge>) -> bool {
 }
 
 impl Supplies {
+    /// Returns whether all [SupplyCartridge] fields are None.
     pub fn all_null(&self) -> bool {
         null_option(&self.c) && null_option(&self.m) && null_option(&self.y) && null_option(&self.k)
+    }
+
+    /// Returns the [SupplyCartridge]s as a Vec, in the CMYK order.
+    pub fn as_vec<'a>(&'a self) -> Vec<&'a Option<SuppliesCartridge>> {
+        return vec![&self.c, &self.m, &self.y, &self.k];
     }
 }
 
