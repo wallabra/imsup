@@ -106,7 +106,7 @@ struct Args {
 
     /// Number of simultaneous ping tasks to run.
     ///
-    /// The default is 512.
+    /// The default is 128.
     #[arg(long, short)]
     ping_parallel: Option<usize>,
 
@@ -210,7 +210,7 @@ async fn main() {
         let num_found = broadcast_ping_printers(
             tx.clone(),
             args.scan_mode.unwrap_or_default() == ScanMode::Cluster,
-            args.ping_parallel.unwrap_or(512),
+            args.ping_parallel.unwrap_or(128),
         )
         .await;
         info!(
